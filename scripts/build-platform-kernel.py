@@ -54,6 +54,13 @@ def main():
     references = set(cli.REFERENCES['kernel'])
     feeds.fetch(ctx, modules, only=references)
     tree.assemble(ctx, modules)
+    # judyln: SDM845 port of ShengUfs, kept in this repository
+    ufs = ctx.tree / 'drivers/ShengUfs'
+    if ufs.is_symlink() or ufs.is_file():
+        ufs.unlink()
+    elif ufs.exists():
+        shutil.rmtree(ufs)
+    shutil.copytree(ROOT / 'drivers/ShengUfs', ufs)
     # UniXNU resolves patch sets as whole directories. Materialize the pinned
     # common set and overlay the reviewed fixes without editing its checkout
     # or accidentally discarding all the other common XNU patches.

@@ -17,6 +17,7 @@ archives = [
   "build-arm-driver.py ArmCpu",
   "build-libpthread-kernel.py",
   "build-mockfs-fixture.py",
+  "build-arm-driver.py ShengUfs",
 ]
 
 [payload]
@@ -28,7 +29,7 @@ title = "polaris: UniXNU platform bring-up"
 # the 8 GiB value 0xfcc00000 is selected with an explicit board override.
 dram_size = "0x7cc00000"
 panic_screen = false
-kernel_args = ["-v", "serial=0", "debug=0x14e", "kt_fixed_zones=120", "cpus=1", "armcpu-self-ipi=1"]
+kernel_args = ["-v", "serial=0", "debug=0x14e", "kt_fixed_zones=120", "cpus=1", "armcpu-self-ipi=1", "native-ufs-probe=2"]
 
 [payload.adt]
 tool = "scripts/make-polaris-adt.py"

@@ -1,0 +1,46 @@
+name: ESP FAT image
+on:
+  workflow_dispatch:
+    inputs:
+      probe_extra:
+        description: 'Extra patch-xnu-entry-probe args (default --no-reset), e.g. --reset-after _PE_init_platform --in _arm_init --reset-delay 8'
+        default: ''
+        type: string
+permissions:
+  contents: read
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the latest kernel and EFI artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          KRUN=$(gh run list -R "$GITHUB_REPOSITORY" -w kernel.yml --status completed --limit 1 --json databaseId --jq '.[0].databaseId')
+          test -n "$KRUN"
+          gh run download -R "$GITHUB_REPOSITORY" "$KRUN" -n platform-kernel-results -D out/kernel
+          test -f out/kernel/kernel.macho && test -f out/kernel/kernel.json
+          CRUN=$(gh run list -R "$GITHUB_REPOSITORY" -w checks.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          test -n "$CRUN"
+          gh run download -R "$GITHUB_REPOSITORY" "$CRUN" -n efi-results -D out/efi
+          test -f out/efi/efi/Build/Out/AARCH64-DEBUG/UniXNU.efi
+      - name: Assemble the probe ESP
+        run: |
+          sudo apt-get update && sudo apt-get install -y mtools clang llvm lld
+          python3 scripts/make-payload-esp.py --kernel out/kernel/kernel.macho --efi out/efi --out out/polaris-esp --cpus 1 --probe-extra "${{ inputs.probe_extra }}"
+      - name: Build the FAT32 image
+        run: |
+          truncate -s 128M esp.img
+          mformat -i esp.img -v POLARISESP ::
+          mcopy -s -i esp.img out/polaris-esp/EFI ::/
+          mdir -i esp.img ::/EFI/UniXNU/Payloads/ > listing.txt
+          cat listing.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: polaris-esp-image
+          path: |
+            esp.img
+            listing.txt
+            out/polaris-esp/esp.json

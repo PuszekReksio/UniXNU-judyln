@@ -10,6 +10,9 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <kern/thread.h>
+#include <sys/param.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSharedPtr.h>
@@ -18,8 +21,10 @@
 #include "GccUfs.h"
 #include "RootDiagnostics.h"
 #include "SmmuTakeover.h"
+#include "TransferPoll.h"
 
 static UfsRootDiagnostics gRootDiagnostic;
+static bool gRootDiagnosticEnabled;
 
 // Probe-only build: SMMU failures are reported by the panic that follows.
 static void rootDiagnosticFailure (const char *reason)
@@ -677,6 +682,202 @@ void NativeUfs::dumpFirmwareList (void)
          ucdPhys, ucd0, ucd1, ucd2, ucd3);
 }
 
+namespace {
+#include "RootTransportLayout.h"
+
+struct UfsHost {
+  OSSharedPtr<IOMemoryMap> hcMap, smmuMap;
+  uintptr_t hc;
+  IOBufferMemoryDescriptor *dma;
+  uint8_t *virt;
+  uint64_t phys;
+  IOLock *lock;
+  bool ready;
+  bool poisoned = false;
+  uintptr_t smmu = 0, cb = 0;
+};
+UfsHost gHost = { OSSharedPtr<IOMemoryMap> (), OSSharedPtr<IOMemoryMap> (), 0, nullptr, nullptr, 0, nullptr, false };
+
+static IOReturn recordTransport (IOReturn result, uint32_t ocs)
+{
+  gRootDiagnostic.result = static_cast<uint32_t> (result);
+  gRootDiagnostic.ocs = ocs;
+  if (result != kIOReturnSuccess && gRootDiagnosticEnabled) {
+    // Read only the already mapped HC's status/registers used by this driver.
+    gRootDiagnostic.hcs = read32 (gHost.hc, 0x30);
+    gRootDiagnostic.hce = read32 (gHost.hc, 0x34);
+    gRootDiagnostic.doorbell = read32 (gHost.hc, 0x58);
+    gRootDiagnostic.interrupt = read32 (gHost.hc, 0x20);
+    gRootDiagnostic.list = uint64_t (read32 (gHost.hc, 0x50)) |
+                          (uint64_t (read32 (gHost.hc, 0x54)) << 32);
+    gRootDiagnostic.runStop = read32 (gHost.hc, 0x60);
+    gRootDiagnostic.ahit = read32 (gHost.hc, 0x18);
+    for (unsigned i = 0; i < 5; ++i) gRootDiagnostic.uic[i] = read32 (gHost.hc, 0x38 + 4 * i);
+    if (gHost.smmu && gHost.cb) {
+      gRootDiagnostic.gfsr = read32 (gHost.smmu, 0x48);
+      gRootDiagnostic.gsyn = read32 (gHost.smmu, 0x54);
+      gRootDiagnostic.fsr = read32 (gHost.cb, 0x58);
+      gRootDiagnostic.fsyn = read32 (gHost.cb, 0x68);
+      gRootDiagnostic.far = uint64_t (read32 (gHost.cb, 0x60)) |
+                            (uint64_t (read32 (gHost.cb, 0x64)) << 32);
+    }
+  }
+  return result;
+}
+
+static void cacheCivac (const void *start, size_t length)
+{
+  uintptr_t address = reinterpret_cast<uintptr_t> (start) & ~uintptr_t (63);
+  uintptr_t end = reinterpret_cast<uintptr_t> (start) + length;
+  for (; address < end; address += 64) {
+    __asm__ volatile ("dc civac, %0" :: "r" (address) : "memory");
+  }
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+// Device-owned cache lines must not be written back over DMA results. All
+// callers use complete 64-byte lines from the dedicated page-aligned buffer.
+static void cacheInvalidate (const void *start, size_t length)
+{
+  __asm__ volatile ("dsb sy" ::: "memory");
+  uintptr_t address = reinterpret_cast<uintptr_t> (start);
+  for (uintptr_t end = address + length; address < end; address += 64) {
+    __asm__ volatile ("dc ivac, %0" :: "r" (address) : "memory");
+  }
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+static void hostWrite (unsigned offset, uint32_t value)
+{
+  __asm__ volatile ("dsb sy" ::: "memory");
+  write32 (gHost.hc, offset, value);
+  __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+#include "RootQueue.h"
+
+#include "RootCommands.h"
+
+// Bring the live controller up for reading: map, SMMU pass-through for the UFS stream, take over
+// the request list, wake the device from UFS-PowerDown and wait for LUN 0 to be ready.
+// `why` receives a short reason on failure.
+static bool hostBringUp (const char **why)
+{
+  if (gHost.poisoned) {
+    *why = "transport quarantined";
+    return false;
+  }
+  if (gHost.ready) {
+    return true;
+  }
+  gRootDiagnostic.stage = "controller map";
+  gHost.hc = mapPhys (UFS_HC_BASE, UFS_HC_SIZE, gHost.hcMap);
+  if (!gHost.hc) {
+    *why = "controller map";
+    return false;
+  }
+  if (gRootDiagnosticEnabled) {
+    gRootDiagnostic.cap = read32 (gHost.hc, 0x00);
+    gRootDiagnostic.version = read32 (gHost.hc, 0x08);
+    gRootDiagnostic.hcs = read32 (gHost.hc, 0x30);
+    gRootDiagnostic.hce = read32 (gHost.hc, 0x34);
+  }
+  gRootDiagnostic.stage = "DMA allocation";
+  gHost.dma = IOBufferMemoryDescriptor::inTaskWithOptions (
+    kernel_task, static_cast<IOOptionBits> (kIODirectionInOut) | static_cast<IOOptionBits> (kIOMemoryPhysicallyContiguous) |
+    static_cast<IOOptionBits> (kIOMemoryMapperNone),
+    kDmaBytes, 4096);
+  gHost.lock = IOLockAlloc ();
+  if (!gHost.dma || !gHost.lock) {
+    *why = "dma buffer";
+    return false;
+  }
+  gHost.virt = static_cast<uint8_t *> (gHost.dma->getBytesNoCopy ());
+  IOByteCount contiguous = 0;
+  gHost.phys = gHost.dma->getPhysicalSegment (0, &contiguous, kIOMemoryMapperNone);
+  gRootDiagnostic.dma = gHost.phys;
+  gRootDiagnostic.contiguous = contiguous;
+  if (!gHost.virt || !gHost.phys || (gHost.phys & 4095) || contiguous < kDmaBytes ||
+      (!(read32 (gHost.hc, 0) & 0x01000000) && gHost.phys + kDmaBytes > 0x100000000ULL)) {
+    *why = "DMA address/contiguity";
+    return false;
+  }
+  bzero (gHost.virt, kDmaBytes);
+  cacheCivac (gHost.virt, kDmaBytes);
+  uint32_t report[3] = { 0, 0, 0 };
+  gRootDiagnostic.stage = "SMMU and request list";
+  if (!hostStopQueue (why)) return false;
+  // judyln: opt-in like adoptAndRead; without it the kernel buffer relies on the apps_smmu
+  // state the firmware left for stream 0x100.
+  unsigned smmuTakeover = 0;
+  PE_parse_boot_argn ("native-ufs-smmu", &smmuTakeover, sizeof (smmuTakeover));
+  if (smmuTakeover == 1) {
+    smmuBypassStream (0x100, gHost.smmuMap, report, gHost.phys, kDmaBytes);
+    gHost.smmu = gHost.smmuMap->getVirtualAddress ();
+    uint32_t idr1 = read32 (gHost.smmu, 0x24);
+    gHost.cb = gHost.smmu + ((1U << (((idr1 >> 28) & 7) + 1)) + (report[0] >> 16)) * 4096;
+  }
+  if (gRootDiagnosticEnabled && gHost.smmu) {
+    gRootDiagnostic.gfsrBefore = read32 (gHost.smmu, 0x48);
+    gRootDiagnostic.fsrBefore = read32 (gHost.cb, 0x58);
+    gRootDiagnostic.smmuId2 = read32 (gHost.smmu, 0x28);
+    gRootDiagnostic.cba2r = read32 (gHost.smmu, 0x1800 + 4 * (report[0] >> 16));
+  }
+  if (!hostStartQueue (why)) return false;
+  gRootDiagnostic.stage = "NOP OUT";
+  // NOP OUT proves the transport before touching the SCSI layer.
+  if (hostNop () != kIOReturnSuccess) {
+    gHost.ready = false;
+    *why = "NOP OUT";
+    return false;
+  }
+  uint32_t power = 0;
+  gRootDiagnostic.stage = "power mode query";
+  if (hostQueryRead (0x03, 0x02, &power) != kIOReturnSuccess) {
+    gHost.ready = false;
+    *why = "power mode query";
+    return false;
+  }
+  gRootDiagnostic.power = power;
+  if ((power & 0xff) != 0x11) {
+    gRootDiagnostic.stage = "device wake";
+    // START STOP UNIT, power condition ACTIVE, to the UFS Device well-known LU (as Linux resumes).
+    uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+    uint32_t scsi = 0;
+    if (hostScsi (0xd0, ssu, 6, false, 0, 500000, &scsi) != kIOReturnSuccess) {
+      gHost.ready = false;
+      *why = "wake (START STOP UNIT)";
+      return false;
+    }
+    IOSleep (50);
+  }
+  gRootDiagnostic.stage = "LUN ready";
+  for (unsigned attempt = 0; attempt < 20; attempt++) {
+    uint8_t tur[6] = { 0, 0, 0, 0, 0, 0 };
+    uint32_t scsi = 0;
+    if (hostScsi (0, tur, 6, false, 0, 200000, &scsi) == kIOReturnSuccess) {
+      gHost.ready = true;
+      return true;
+    }
+    if (gHost.poisoned) break;
+    IOSleep (10);
+  }
+  gHost.ready = false;
+  *why = "LUN 0 not ready";
+  return false;
+}
+}
+
+namespace {
+static uint32_t be32w (const uint8_t *at)
+{
+  return (uint32_t (at[0]) << 24) | (uint32_t (at[1]) << 16) | (uint32_t (at[2]) << 8) | at[3];
+}
+
+#include "RootLayout.h"
+#include "RootWindowRead.h"
+}
+
 bool NativeUfs::start (IOService *provider)
 {
   unsigned probe = 0;
@@ -694,6 +895,56 @@ bool NativeUfs::start (IOService *provider)
   }
   if ((probe >= 3 && probe <= 5) || probe == 9) {
     adoptAndRead (probe);
+  }
+  if (probe == 10) {
+    // Read-only check before anything is flashed: LUN 0 GPT -> "userdata" -> its first block.
+    const char *why = "";
+    if (!hostBringUp (&why)) {
+      panic ("NATIVE_UFS root check: bring-up failed: %s", why);
+    }
+    RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
+    if (!layout || !findRootLayout (layout, &why)) {
+      panic ("NATIVE_UFS root check: %s", why);
+    }
+    panic ("NATIVE_UFS root check\n"
+           "userdata first=%llx last=%llx\n"
+           "block0 magic %08x %08x ext4magic=%04x ext4blocks=%u\n"
+           "manifest status=%u windows=%u",
+           layout->userdataFirst, layout->userdataLast, layout->magic0, layout->magic1,
+           layout->ext4Magic, layout->ext4Blocks, layout->manifestStatus, layout->windows);
+  }
+  if (probe == 11) {
+    // After the root image is flashed: manifest, then each window's own GPT (sector 1 of the
+    // attached dmg disk image carries "EFI PART"). Read-only.
+    const char *why = "";
+    if (!hostBringUp (&why)) {
+      panic ("NATIVE_UFS root windows: bring-up failed: %s", why);
+    }
+    RootLayout *layout = static_cast<RootLayout *> (IOMalloc (sizeof (RootLayout)));
+    if (!layout || !findRootLayout (layout, &why)) {
+      panic ("NATIVE_UFS root windows: %s", why);
+    }
+    uint32_t sig[4][2] = {};
+    uint32_t seen[4] = {};
+    for (uint32_t index = 0; index < layout->windows && index < 4; index++) {
+      uint64_t absolute = layout->userdataFirst * 4096ULL + layout->window[index].offset;
+      if (hostRead4k (0, absolute / 4096, 1, gScratch) == kIOReturnSuccess) {
+        seen[index] = 1;
+        sig[index][0] = le32 (gScratch + 512);
+        sig[index][1] = le32 (gScratch + 516);
+      }
+    }
+    panic ("NATIVE_UFS root windows\n"
+           "userdata first=%llx last=%llx manifest status=%u windows=%u\n"
+           "w0 %s off=%llx size=%llx gpt=%08x %08x read=%u\n"
+           "w1 %s off=%llx size=%llx gpt=%08x %08x read=%u\n"
+           "w0 sha %08x %08x %08x %08x\n"
+           "w1 sha %08x %08x %08x %08x",
+           layout->userdataFirst, layout->userdataLast, layout->manifestStatus, layout->windows,
+           layout->window[0].name, layout->window[0].offset, layout->window[0].size, sig[0][0], sig[0][1], seen[0],
+           layout->window[1].name, layout->window[1].offset, layout->window[1].size, sig[1][0], sig[1][1], seen[1],
+           be32w (layout->window[0].sha256), be32w (layout->window[0].sha256 + 4), be32w (layout->window[0].sha256 + 8), be32w (layout->window[0].sha256 + 12),
+           be32w (layout->window[1].sha256), be32w (layout->window[1].sha256 + 4), be32w (layout->window[1].sha256 + 8), be32w (layout->window[1].sha256 + 12));
   }
   return false;
 }

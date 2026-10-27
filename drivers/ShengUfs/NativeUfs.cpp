@@ -11,6 +11,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <libkern/crypto/sha2.h>
 #include <kern/thread.h>
 #include <sys/param.h>
 #include <libkern/c++/OSData.h>

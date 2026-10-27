@@ -47,6 +47,10 @@ def _node(name, properties=(), children=()):
                 value = new
                 break
         mapped.append((key, value))
+    if name == 'chosen':
+        # Original AMFI (prelinked iPadOS 17) panics without it; same value as
+        # UniXNU's qemu-entry/make-dt.py --amfi-platform-only.
+        mapped.append(('amfi-only-platform-code', _polaris.u32(1)))
     return _polaris_node(name, mapped, children)
 
 

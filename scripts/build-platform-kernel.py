@@ -121,10 +121,19 @@ def main():
         prelinked = kernel.prelink(ctx)
         print(f'PASS: prelinked kernel {prelinked} sha256 '
               f'{hashlib.sha256(prelinked.read_bytes()).hexdigest()}', flush=True)
+        # The composition carries original Apple components: keep it out of
+        # kernel/ (the uploaded artifact) and restore the source kernel there.
+        kept = ctx.work / 'prelinked'
+        kept.mkdir(parents=True, exist_ok=True)
+        for item in (prelinked, prelinked.with_suffix('.json')):
+            if item.exists():
+                shutil.move(str(item), kept / item.name)
+        shutil.copyfile(source, destination)
     report = {'kernel_sha256': hashlib.sha256(data).hexdigest(), 'kernel_bytes': len(data),
               'unixnu_revision': revision, 'bootstrap_link_failed': bootstrap_failed,
               'final_configured_link_passed': True,
-              'original_components_prelinked': prelinked is not None,
+              'original_components_prelinked': False,
+              'prelink_pass_completed': prelinked is not None,
               'hardware_booted': False, 'userland_booted': False,
               'sources': {name: module.commit for (_, name), module in modules.items() if module.commit}}
     destination.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')

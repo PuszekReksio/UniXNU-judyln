@@ -15,12 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('component', choices=['ArmDTPlatform', 'ArmCpu'])
+    parser.add_argument('component', choices=['ArmDTPlatform', 'ArmCpu', 'ShengUfs'])
     args = parser.parse_args()
-    out = ROOT / 'build' / {'ArmCpu': 'armcpu', 'ArmDTPlatform': 'armdt-platform'}[args.component]
+    out = ROOT / 'build' / {'ArmCpu': 'armcpu', 'ArmDTPlatform': 'armdt-platform', 'ShengUfs': 'sheng-ufs'}[args.component]
     recipe = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
     record = json.loads(recipe.read_text().strip().rstrip(','))
-    source = ROOT / 'drivers' / args.component / (args.component + '.cpp')
+    # ShengUfs keeps its upstream source name (runtime class NativeUfs)
+    source = ROOT / 'drivers' / args.component / ({'ShengUfs': 'NativeUfs'}.get(args.component, args.component) + '.cpp')
     destination = out / (args.component + '.o')
     out.mkdir(parents=True, exist_ok=True)
     command = []
@@ -41,7 +42,8 @@ def main():
     command.extend(['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
                     '-Wno-c99-designator', '-Wno-reorder-init-list',
                     '-Wno-deprecated-enum-enum-conversion',
-                    '-I', str(ROOT / '.cache/xnu-work/osfmk')])
+                    '-I', str(ROOT / '.cache/xnu-work/osfmk'),
+                    '-I', str(source.parent)])
     (out / 'compile-command.json').write_text(json.dumps(command, indent=2) + '\n')
     result = subprocess.run(command, cwd=record['directory'], capture_output=True, text=True)
     (out / 'compile.log').write_text(result.stdout + result.stderr)

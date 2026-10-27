@@ -124,10 +124,7 @@ def main():
     report = {'kernel_sha256': hashlib.sha256(data).hexdigest(), 'kernel_bytes': len(data),
               'unixnu_revision': revision, 'bootstrap_link_failed': bootstrap_failed,
               'final_configured_link_passed': True,
-              # kernel.macho is always the plain source kernel; the prelinked
-              # composition stays in the work tree and is reported separately
-              'original_components_prelinked': False,
-              'prelink_pass_completed': prelinked is not None,
+              'original_components_prelinked': prelinked is not None,
               'hardware_booted': False, 'userland_booted': False,
               'sources': {name: module.commit for (_, name), module in modules.items() if module.commit}}
     destination.with_suffix('.json').write_text(json.dumps(report, indent=2) + '\n')

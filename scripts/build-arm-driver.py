@@ -17,7 +17,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('component', choices=['ArmDTPlatform', 'ArmCpu', 'ShengUfs'])
     args = parser.parse_args()
-    out = ROOT / 'build' / {'ArmCpu': 'armcpu', 'ArmDTPlatform': 'armdt-platform', 'ShengUfs': 'sheng-ufs'}[args.component]
+    out = ROOT / 'build' / {'ArmCpu': 'armcpu', 'ArmDTPlatform': 'armdt-platform', 'ShengUfs': 'native-ufs'}[args.component]
     recipe = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
     record = json.loads(recipe.read_text().strip().rstrip(','))
     # ShengUfs keeps its upstream source name (runtime class NativeUfs)
@@ -61,7 +61,8 @@ def main():
         offset += length
     if deployment != (2, 0x110000):
         raise SystemExit(f'Expected iOS 17 deployment, got {deployment}')
-    archive = out / ('lib' + args.component + '.a')
+    # The pinned build-xnu-4k-baseline.sh links build/native-ufs/libNativeUfs.a
+    archive = out / ('lib' + {'ShengUfs': 'NativeUfs'}.get(args.component, args.component) + '.a')
     archive.unlink(missing_ok=True)
     subprocess.run(['xcrun', 'ar', 'rcs', archive, destination], check=True)
     print(f'{args.component}: ARM64/iOS 17 archive built')

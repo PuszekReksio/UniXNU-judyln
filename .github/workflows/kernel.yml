@@ -50,6 +50,13 @@ jobs:
           name: platform-kernel-results
           path: |
             out/native/polaris/kernel/
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: platform-kernel-logs
+          path: |
+            out/native/polaris/logs/
+            out/native/polaris/tree/build/native-ufs/compile.log
 
   native-check:
     needs: kernel

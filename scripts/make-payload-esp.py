@@ -41,6 +41,7 @@ def main():
                         help='EFI build output (efi/Build/... and loader/build/...), as produced by check-efi.py')
     parser.add_argument('--out', type=Path, default=ROOT / 'out/polaris-esp')
     parser.add_argument('--ram', type=int, choices=(6, 8), default=6)
+    parser.add_argument('--board', choices=('polaris', 'judyln'), default='polaris')
     parser.add_argument('--cpus', type=int, default=1,
                         help='CPUs described by the ADT and requested by the command line (1..8)')
     parser.add_argument('--owned-memory-size', type=lambda v: int(v, 0), default=0x40000000)
@@ -78,11 +79,15 @@ def main():
     else:
         kernel_args.append(f'cpus={args.cpus}')
 
-    adt_tool = load_module('polaris_adt', ROOT / 'scripts/make-polaris-adt.py')
     prefix = load_module('cpu_prefix', ROOT / 'scripts/check-cpu-prefix.py')
-    adt = adt_tool.build(cpu_count=args.cpus,
-                         dram_size=adt_tool.DRAM_SIZE_6 if args.ram == 6 else adt_tool.DRAM_SIZE_8,
-                         owned_memory_size=args.owned_memory_size)
+    if args.board == 'judyln':
+        adt_tool = load_module('judyln_adt', ROOT / 'scripts/make-judyln-adt.py')
+        adt = adt_tool.build(cpu_count=args.cpus, owned_memory_size=args.owned_memory_size)
+    else:
+        adt_tool = load_module('polaris_adt', ROOT / 'scripts/make-polaris-adt.py')
+        adt = adt_tool.build(cpu_count=args.cpus,
+                             dram_size=adt_tool.DRAM_SIZE_6 if args.ram == 6 else adt_tool.DRAM_SIZE_8,
+                             owned_memory_size=args.owned_memory_size)
     try:
         prefix.validate(adt, ' '.join(kernel_args))
     except ValueError as error:

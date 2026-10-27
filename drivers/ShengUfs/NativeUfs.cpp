@@ -757,7 +757,12 @@ static void hostWrite (unsigned offset, uint32_t value)
 
 #include "RootQueue.h"
 
+#pragma clang diagnostic push
+// Probe-only build: the write/store helpers of these headers are not called yet.
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
 #include "RootCommands.h"
+#pragma clang diagnostic pop
 
 // Bring the live controller up for reading: map, SMMU pass-through for the UFS stream, take over
 // the request list, wake the device from UFS-PowerDown and wait for LUN 0 to be ready.
@@ -876,7 +881,12 @@ static uint32_t be32w (const uint8_t *at)
 }
 
 #include "RootLayout.h"
+#pragma clang diagnostic push
+// Probe-only build: the write/store helpers of these headers are not called yet.
+#pragma clang diagnostic ignored "-Wunused-function"
+#pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
 #include "RootWindowRead.h"
+#pragma clang diagnostic pop
 }
 
 bool NativeUfs::start (IOService *provider)

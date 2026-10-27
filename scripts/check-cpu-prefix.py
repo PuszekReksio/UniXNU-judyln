@@ -50,8 +50,8 @@ def validate(adt_bytes, cmdline):
     if root_name != 'device-tree' or end != len(adt_bytes):
         raise TopologyError('not a polaris platform ADT')
     compatible = root.get('compatible') or b''
-    if b'xiaomi,polaris\0' not in compatible or b'qcom,sdm845\0' not in compatible:
-        raise TopologyError('not a Polaris/SDM845 ADT')
+    if not (b'xiaomi,polaris\0' in compatible or b'lge,judyln\0' in compatible) or b'qcom,sdm845\0' not in compatible:
+        raise TopologyError('not a polaris or judyln SDM845 ADT')
     tokens = cmdline.split()
     selections = [token for token in tokens if token.startswith('cpus=')]
     if len(selections) != 1 or any(token.startswith('cpumask=') for token in tokens):
